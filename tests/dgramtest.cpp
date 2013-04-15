@@ -55,14 +55,14 @@ TEST(Datagram, BinaryTest) {
 	    sprintf(buf+i*2,"%02x",*(data+i));
 	buf[i*2] = 0;
 	EXPECT_STREQ("74657874ababcdabcdef01000abcdefabcdeff",buf);
-	ASSERT_EQ(datalen,Channel::SendTo(socket, addr, snd));
+	ASSERT_EQ(datalen,Channel::SendTo(socket, addr, &snd));
 	evbuffer_free(snd);
 	event_assign(&evrecv, evbase, socket, EV_READ, ReceiveCallback, NULL);
 	event_add(&evrecv, NULL);
 	event_base_dispatch(evbase);
 	struct evbuffer *rcv = evbuffer_new();
 	Address address;
-	ASSERT_EQ(datalen,Channel::RecvFrom(socket, address, rcv));
+	ASSERT_EQ(datalen,Channel::RecvFrom(socket, address, &rcv));
 	evbuffer_remove(rcv, buf, strlen(text));
 	buf[strlen(text)] = 0;
 	uint8_t rnum8 = evbuffer_remove_8(rcv);
@@ -92,14 +92,14 @@ TEST(Datagram,TwoPortTest) {
 	addr2.sin_addr.s_addr = htonl(INADDR_LOOPBACK);*/
 	struct evbuffer *snd = evbuffer_new();
 	evbuffer_add_32be(snd, 1234);
-	Channel::SendTo(sock1,Address("127.0.0.1:10002"),snd);
+	Channel::SendTo(sock1,Address("127.0.0.1:10002"),&snd);
 	evbuffer_free(snd);
 	event_assign(&evrecv, evbase, sock2, EV_READ, ReceiveCallback, NULL);
 	event_add(&evrecv, NULL);
 	event_base_dispatch(evbase);
 	struct evbuffer *rcv = evbuffer_new();
 	Address address;
-	Channel::RecvFrom(sock2, address, rcv);
+	Channel::RecvFrom(sock2, address, &rcv);
 	uint32_t test = evbuffer_remove_32be(rcv);
 	ASSERT_EQ(1234,test);
 	evbuffer_free(rcv);

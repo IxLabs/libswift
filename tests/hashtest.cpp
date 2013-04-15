@@ -34,7 +34,7 @@ TEST(Sha1HashTest,OfferDataTest) {
 	//	roothash123 = Sha1Hash(roothash123,Sha1Hash::ZERO);
     unlink("123");
     EXPECT_STREQ(rooth123,roothash123.hex().c_str());
-    Storage storage("123");
+    Storage storage("123", ".", 4);
 	MmapHashTree tree(&storage,roothash123);
     tree.OfferHash(bin_t(0,0),Sha1Hash(true,hash123));
 	ASSERT_EQ(1,tree.size_in_chunks());
@@ -48,7 +48,7 @@ TEST(Sha1HashTest,SubmitTest) {
     FILE* f123 = fopen("123","wb+");
     fprintf(f123, "123\n");
     fclose(f123);
-    Storage storage("123");
+    Storage storage("123", ".", 4);
     MmapHashTree ht123(&storage);
     EXPECT_STREQ(hash123,ht123.hash(bin_t(0,0)).hex().c_str());
     EXPECT_STREQ(rooth123,ht123.root_hash().hex().c_str());
@@ -72,7 +72,7 @@ TEST(Sha1HashTest,OfferDataTest2) {
 	Sha1Hash roothash456(Sha1Hash(true,hash456a),Sha1Hash(true,hash456b));
     unlink("456");
     EXPECT_STREQ(rooth456,roothash456.hex().c_str());
-    Storage storage("456");
+    Storage storage("456", ".", 4);
 	MmapHashTree tree(&storage,roothash456);
 	tree.OfferHash(bin_t(1,0),roothash456);
     tree.OfferHash(bin_t(0,0),Sha1Hash(true,hash456a));
