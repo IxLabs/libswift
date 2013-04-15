@@ -30,6 +30,7 @@ void ReportCallback(int fd, short event, void *arg);
 void EndCallback(int fd, short event, void *arg);
 void RescanDirCallback(int fd, short event, void *arg);
 int CreateMultifileSpec(std::string specfilename, int argc, char *argv[], int argidx);
+void TimerCallback(int fd, short event, void *arg);
 
 // Gateway stuff
 bool InstallHTTPGateway(struct event_base *evbase,Address addr,uint32_t chunk_size, double *maxspeed);
@@ -41,7 +42,7 @@ void CmdGwUpdateDLStatesCallback();
 
 
 // Global variables
-struct event evreport, evrescan, evend;
+struct event evreport, evrescan, evend, evtimer;
 int single_fd = -1;
 bool file_enable_checkpoint = false;
 bool file_checkpointed = false;
@@ -373,6 +374,9 @@ int utf8main (int argc, char** argv)
     	evtimer_add(&evend, tint2tv(wait_time));
     }
 
+	evtimer_assign(&evtimer, Channel::evbase, TimerCallback, NULL);
+	evtimer_add(&evtimer, tint2tv(TIMER_USEC));
+
     // Enter mainloop, if daemonizing
     if (wait_time == TINT_NEVER || (long)wait_time > 0) {
 		// Arno: always, for statsgw, rate control, etc.
@@ -573,11 +577,13 @@ void ReportCallback(int fd, short event, void *arg) {
 		if (report_progress) {
 			fprintf(stderr,
 				"%s %lli of %lli (seq %lli) %lli dgram %lli bytes up, "	\
-				"%lli dgram %lli bytes down\n",
+				"%lli dgram %lli bytes down mptp[send:%lli,%lli;recv:%lli,%lli]\n",
 				IsComplete(single_fd ) ? "DONE" : "done",
 				Complete(single_fd), Size(single_fd), SeqComplete(single_fd),
 				Channel::global_dgrams_up, Channel::global_raw_bytes_up,
-				Channel::global_dgrams_down, Channel::global_raw_bytes_down );
+				Channel::global_dgrams_down, Channel::global_raw_bytes_down,
+				Channel::global_buffers_up, Channel::global_syscalls_up,
+				Channel::global_buffers_down, Channel::global_syscalls_down);
 		}
 
         FileTransfer *ft = FileTransfer::file(single_fd);
@@ -638,6 +644,11 @@ void ReportCallback(int fd, short event, void *arg) {
     //     nat_test_update();
 
 	evtimer_add(&evreport, tint2tv(REPORT_INTERVAL*TINT_SEC));
+}
+
+void TimerCallback(int fd, short event, void *arg) {
+	Channel::messageQueue.Flush();
+	evtimer_add(&evtimer, tint2tv(TIMER_USEC));
 }
 
 void EndCallback(int fd, short event, void *arg) {

@@ -1,4 +1,4 @@
-# Written by Victor Grishchenko, Arno Bakker 
+#Written by Victor Grishchenko, Arno Bakker 
 # see LICENSE.txt for license information
 #
 # Requirements:
@@ -21,6 +21,7 @@ TestDir='tests'
 
 target = 'swift'
 source = [ 'bin.cpp', 'binmap.cpp', 'sha1.cpp','hashtree.cpp',
+           'httpgw.cpp',
     	   'transfer.cpp', 'channel.cpp', 'sendrecv.cpp', 'send_control.cpp', 
     	   'compat.cpp','avgspeed.cpp', 'avail.cpp', 'cmdgw.cpp', 
            'storage.cpp', 'zerostate.cpp', 'zerohashtree.cpp']
@@ -28,7 +29,7 @@ source = [ 'bin.cpp', 'binmap.cpp', 'sha1.cpp','hashtree.cpp',
 
 env = Environment()
 if sys.platform == "win32":
-    libevent2path = '\\build\\libevent-2.0.19-stable'
+    libevent2path = '/usr/local/lib/libevent-2.0.so.5 '
     #libevent2path = '\\build\\ttuki\\libevent-2.0.15-arno-http'
 
     # "MSVC works out of the box". Sure.
@@ -112,6 +113,7 @@ else:
         libpath = ""
         print "To use external libs, set LIBPATH environment variable to list of colon-separated lib dirs"
     libpath += libevent2path+'/lib:'
+    libpath += os.path.join('#', Dir('.').path)
 
     linkflags = '-Wl,-rpath,'+libevent2path+'/lib'
     env.Append(LINKFLAGS=linkflags);
@@ -141,4 +143,4 @@ Export("libs")
 Export("libpath")
 Export("DEBUG")
 # Arno: uncomment to build tests
-#SConscript('tests/SConscript')
+SConscript('tests/SConscript')

@@ -18,6 +18,7 @@ using namespace swift;
 using namespace std;
 
 struct event_base *Channel::evbase;
+MessageQueue Channel::messageQueue;
 struct event Channel::evrecv;
 
 #define DEBUGTRAFFIC 	0
@@ -194,7 +195,7 @@ void    Channel::Send () {
 			}
 			AddPex(evb);
 			TimeoutDataOut();
-			data = AddData(evb);
+			data = AddData(&evb);
     	} else {
     		// Arno: send explicit close
     		AddHandshake(evb);
@@ -214,16 +215,20 @@ void    Channel::Send () {
     dprintf("%s #%u sent %ib %s:%x\n",
             tintstr(),id_,(int)evbuffer_get_length(evb),peer().str(),
             peer_channel_id_);
-    int r = SendTo(socket_,peer(),evb);
-    if (r==-1)
-        print_error("swift can't send datagram");
-    else
-    	raw_bytes_up_ += r;
-    last_send_time_ = NOW;
-    sent_since_recv_++;
-    dgrams_sent_++;
-    evbuffer_free(evb);
-    Reschedule();
+
+	messageQueue.AddBuffer(socket_, evb, peer(), this); 
+}
+
+void Channel::Sent(int bytes, evbuffer *evb, bool tofree)
+{
+	raw_bytes_up_ += bytes;
+	if (tofree) {
+		last_send_time_ = NOW;
+		sent_since_recv_++;
+		dgrams_sent_++;
+		evbuffer_free(evb);
+		Reschedule();
+	}
 }
 
 void    Channel::AddHint (struct evbuffer *evb) {
@@ -306,7 +311,7 @@ void    Channel::AddHint (struct evbuffer *evb) {
 }
 
 
-bin_t        Channel::AddData (struct evbuffer *evb) {
+bin_t        Channel::AddData (struct evbuffer **evb) {
 	// RATELIMIT
 	if (transfer().GetCurrentSpeed(DDIR_UPLOAD) > transfer().GetMaxSpeed(DDIR_UPLOAD)) {
 		transfer().OnSendNoData();
@@ -335,11 +340,11 @@ bin_t        Channel::AddData (struct evbuffer *evb) {
         return bin_t::NONE; // once in a while, empty data is sent just to check rtt FIXED
 
     if (ack_in_.is_empty() && hashtree()->size())
-        AddPeakHashes(evb);
+        AddPeakHashes(*evb);
 
     //NETWVSHASH
     if (hashtree()->get_check_netwvshash())
-    	AddUncleHashes(evb,tosend);
+    	AddUncleHashes(*evb,tosend);
 
     if (!ack_in_.is_empty()) // TODO: cwnd_>1
         data_out_cap_ = tosend;
@@ -349,14 +354,13 @@ bin_t        Channel::AddData (struct evbuffer *evb) {
     // frame with DATA. Send 2 datagrams then, one with peaks so they have
     // a better chance of arriving. Optimistic violation of atomic datagram
     // principle.
-    if (hashtree()->chunk_size() == SWIFT_DEFAULT_CHUNK_SIZE && evbuffer_get_length(evb) > SWIFT_MAX_NONDATA_DGRAM_SIZE) {
+    if (hashtree()->chunk_size() == SWIFT_DEFAULT_CHUNK_SIZE && evbuffer_get_length(*evb) > SWIFT_MAX_NONDATA_DGRAM_SIZE) {
         dprintf("%s #%u fsent %ib %s:%x\n",
-                tintstr(),id_,(int)evbuffer_get_length(evb),peer().str(),
+                tintstr(),id_,(int)evbuffer_get_length(*evb),peer().str(),
                 peer_channel_id_);
-    	int ret = Channel::SendTo(socket_,peer(),evb); // kind of fragmentation
-    	if (ret > 0)
-    		raw_bytes_up_ += ret;
-        evbuffer_add_32be(evb, peer_channel_id_);
+		messageQueue.AddBuffer(socket_, *evb, peer(), this, false);
+		*evb = evbuffer_new();
+        evbuffer_add_32be(*evb, peer_channel_id_);
     }
 
     if (hashtree()->chunk_size() != SWIFT_DEFAULT_CHUNK_SIZE && isretransmit) {
@@ -373,15 +377,15 @@ bin_t        Channel::AddData (struct evbuffer *evb) {
     	 */
  	     char binstr[32];
          fprintf(stderr,"AddData: retransmit of randomized chunk %s\n",tosend.str(binstr) );
-         evbuffer_add_8(evb, SWIFT_RANDOMIZE);
-         evbuffer_add_32be(evb, (int)rand() );
+         evbuffer_add_8(*evb, SWIFT_RANDOMIZE);
+         evbuffer_add_32be(*evb, (int)rand() );
     }
 
-    evbuffer_add_8(evb, SWIFT_DATA);
-    evbuffer_add_32be(evb, bin_toUInt32(tosend));
+    evbuffer_add_8(*evb, SWIFT_DATA);
+    evbuffer_add_32be(*evb, bin_toUInt32(tosend));
 
     struct evbuffer_iovec vec;
-    if (evbuffer_reserve_space(evb, hashtree()->chunk_size(), &vec, 1) < 0) {
+    if (evbuffer_reserve_space(*evb, hashtree()->chunk_size(), &vec, 1) < 0) {
 	print_error("error on evbuffer_reserve_space");
 	return bin_t::NONE;
     }
@@ -391,12 +395,12 @@ bin_t        Channel::AddData (struct evbuffer *evb) {
     if (r<0) {
         print_error("error on reading");
         vec.iov_len = 0;
-        evbuffer_commit_space(evb, &vec, 1);
+        evbuffer_commit_space(*evb, &vec, 1);
         return bin_t::NONE;
     }
     // assert(dgram.space()>=r+4+1);
     vec.iov_len = r;
-    if (evbuffer_commit_space(evb, &vec, 1) < 0) {
+    if (evbuffer_commit_space(*evb, &vec, 1) < 0) {
         print_error("error on evbuffer_commit_space");
         return bin_t::NONE;
     }
@@ -1008,106 +1012,119 @@ void Channel::LibeventReceiveCallback(evutil_socket_t fd, short event, void *arg
     event_add(&evrecv, NULL);
 }
 
+#define NUM_DATAGRAMS 10
+
 void    Channel::RecvDatagram (evutil_socket_t socket) {
-    struct evbuffer *evb = evbuffer_new();
-    Address addr;
+	struct evbuffer *pevb[NUM_DATAGRAMS];
+	
+	for (int i=0; i<NUM_DATAGRAMS; ++i)
+		pevb[i] = evbuffer_new();
+	
+	Address addr;
+	//FIXME: make this more readable
+	free(addr.addr);
+	addr.addr = (struct sockaddr_mptp *) calloc(1, sizeof(struct sockaddr_mptp) + NUM_DATAGRAMS * sizeof(struct mptp_dest));
+	addr.addr->count = NUM_DATAGRAMS;
+    	RecvFrom(socket, addr, pevb);
+	int i = 0;
+	for (; i<addr.addr->count; ++i) {
+		struct evbuffer *evb = pevb[i];
+		Address fromi;
+		fromi.addr->dests[0].addr = addr.addr->dests[i].addr;
+		fromi.addr->dests[0].port = addr.addr->dests[i].port;
+		size_t evboriglen = evbuffer_get_length(evb);
+#define return_log(...) { fprintf(stderr,__VA_ARGS__); evbuffer_free(evb); return; }
+		if (evbuffer_get_length(evb)<4)
+			return_log("socket layer weird: datagram shorter than 4 bytes from %s (prob ICMP unreach)\n",fromi.str());
+		uint32_t mych = evbuffer_remove_32be(evb);
+		Sha1Hash hash;
+		Channel* channel = NULL;
+		if (mych==0) { // peer initiates handshake
+			if (evbuffer_get_length(evb)<1+4+1+4+Sha1Hash::SIZE)
+				return_log ("%s #0 incorrect size %i initial handshake packet %s\n",
+						tintstr(),(int)evbuffer_get_length(evb),fromi.str());
+			uint8_t hashid = evbuffer_remove_8(evb);
+			if (hashid!=SWIFT_HASH)
+				return_log ("%s #0 no hash in the initial handshake %s\n",
+						tintstr(),fromi.str());
+			bin_t pos = bin_fromUInt32(evbuffer_remove_32be(evb));
+			if (!pos.is_all())
+				return_log ("%s #0 that is not the root hash %s\n",tintstr(),fromi.str());
+			hash = evbuffer_remove_hash(evb);
+			FileTransfer* ft = FileTransfer::Find(hash);
+			if (!ft) {
+    				ZeroState *zs = ZeroState::GetInstance();
+            			ft = zs->Find(hash);
+            			if (!ft)
+				return_log ("%s #0 hash %s unknown, requested by %s\n",tintstr(),hash.hex().c_str(),fromi.str());
+			} else if (ft->IsZeroState() && !ft->hashtree()->is_complete()) {
+	    			return_log ("%s #0 zero hash %s broken, requested by %s\n",tintstr(),hash.hex().c_str(),fromi.str());
+			}
+       			if (!ft->IsOperational())
+        		{
+            			return_log ("%s #0 hash %s broken, requested by %s\n",tintstr(),hash.hex().c_str(),fromi.str());
+        		}
 
-    RecvFrom(socket, addr, evb);
-    size_t evboriglen = evbuffer_get_length(evb);
+			dprintf("%s #0 -hash ALL %s\n",tintstr(),hash.hex().c_str());
 
-//#define return_log(...) { fprintf(stderr,__VA_ARGS__); evbuffer_free(evb); return; }
-#define return_log(...) { dprintf(__VA_ARGS__); evbuffer_free(evb); return; }
-    if (evbuffer_get_length(evb)<4)
-        return_log("socket layer weird: datagram < 4 bytes from %s (prob ICMP unreach)\n",addr.str());
-    uint32_t mych = evbuffer_remove_32be(evb);
-    Sha1Hash hash;
-    Channel* channel = NULL;
-    if (mych==0) { // peer initiates handshake
-        if (evbuffer_get_length(evb)<1+4+1+4+Sha1Hash::SIZE)
-            return_log ("%s #0 incorrect size %i initial handshake packet %s\n",
-                        tintstr(),(int)evbuffer_get_length(evb),addr.str());
-        uint8_t hashid = evbuffer_remove_8(evb);
-        if (hashid!=SWIFT_HASH)
-            return_log ("%s #0 no hash in the initial handshake %s\n",
-                        tintstr(),addr.str());
-        bin_t pos = bin_fromUInt32(evbuffer_remove_32be(evb));
-        if (!pos.is_all())
-            return_log ("%s #0 that is not the root hash %s\n",tintstr(),addr.str());
-        hash = evbuffer_remove_hash(evb);
-        FileTransfer* ft = FileTransfer::Find(hash);
-        if (!ft)
-        {
-            ZeroState *zs = ZeroState::GetInstance();
-            ft = zs->Find(hash);
-            if (!ft)
-                return_log ("%s #0 hash %s unknown, requested by %s\n",tintstr(),hash.hex().c_str(),addr.str());
-        }
-	else if (ft->IsZeroState() && !ft->hashtree()->is_complete())
-	{
-	    return_log ("%s #0 zero hash %s broken, requested by %s\n",tintstr(),hash.hex().c_str(),addr.str());
+			// Arno, 2012-02-27: Check for duplicate channel
+			Channel* existchannel = ft->FindChannel(fromi,NULL);
+			if (existchannel)
+			{
+				// Arno: 2011-10-13: Ignore if established, otherwise consider
+				// it a concurrent connection attempt.
+				if (existchannel->is_established()) {
+					// ARNOTODO: Read complete handshake here so we know whether
+					// attempt is to new channel or to existing. Currently read
+					// in OnHandshake()
+					//
+					return_log("%s #0 have a channel already to %s\n",tintstr(),fromi.str());
+				} else {
+					channel = existchannel;
+					//fprintf(stderr,"Channel::RecvDatagram: HANDSHAKE: reuse channel %s\n", channel->peer_.str() );
+				}
+			}
+			if (channel == NULL) {
+				//fprintf(stderr,"Channel::RecvDatagram: HANDSHAKE: create new channel %s\n", addr.str() );
+				channel = new Channel(ft, socket, fromi);
+			}
+			//fprintf(stderr,"CHANNEL INCOMING DEF hass %s is id %d\n",hash.hex().c_str(),channel->id());
+    		} else if (mych==CMDGW_TUNNEL_DEFAULT_CHANNEL_ID) {
+    			// SOCKTUNNEL
+    			CmdGwTunnelUDPDataCameIn(addr,CMDGW_TUNNEL_DEFAULT_CHANNEL_ID,evb);
+    			evbuffer_free(evb);
+    			return;
+
+		} else { // peer responds to my handshake (and other messages)
+			mych = DecodeID(mych);
+			if (mych>=channels.size())
+				return_log("%s invalid channel #%u, %s\n",tintstr(),mych,fromi.str());
+			channel = channels[mych];
+			if (!channel)
+				return_log ("%s #%u is already closed\n",tintstr(),mych);
+			if (channel->IsDiffSenderOrDuplicate(fromi,mych)) {
+				channel->Schedule4Close();
+	    			return_log ("%s #%u is duplicate\n",tintstr(),mych);
+			}
+			channel->own_id_mentioned_ = true;
+		}
+		channel->raw_bytes_down_ += evboriglen;
+		//dprintf("recvd %i bytes for %i\n",data.size(),channel->id);
+		bool wasestablished = channel->is_established();
+
+		//dprintf("%s #%u peer %s recv_peer %s addr %s\n", tintstr(),mych, channel->peer().str(), channel->recv_peer().str(), fromi.str() );
+
+		channel->Recv(evb);
+
+		evbuffer_free(evb);
+		//SAFECLOSE
+		if (wasestablished && !channel->is_established()) {
+			// Arno, 2012-01-26: Received an explict close, clean up channel, safely.
+			channel->Schedule4Close();
+		}
 	}
-        if (!ft->IsOperational())
-        {
-            return_log ("%s #0 hash %s broken, requested by %s\n",tintstr(),hash.hex().c_str(),addr.str());
-        }
-
-        dprintf("%s #0 -hash ALL %s\n",tintstr(),hash.hex().c_str());
-
-        // Arno, 2012-02-27: Check for duplicate channel
-        Channel* existchannel = ft->FindChannel(addr,NULL);
-        if (existchannel)
-        {
-             // Arno: 2011-10-13: Ignore if established, otherwise consider
-             // it a concurrent connection attempt.
-             if (existchannel->is_established()) {
-                  // ARNOTODO: Read complete handshake here so we know whether
-                  // attempt is to new channel or to existing. Currently read
-                  // in OnHandshake()
-                  //
-		  return_log("%s #0 have a channel already to %s\n",tintstr(),addr.str());
-	     } else {
-		channel = existchannel;
-		//fprintf(stderr,"Channel::RecvDatagram: HANDSHAKE: reuse channel %s\n", channel->peer_.str() );
-	     }
-        }
-        if (channel == NULL) {
-        	//fprintf(stderr,"Channel::RecvDatagram: HANDSHAKE: create new channel %s\n", addr.str() );
-        	channel = new Channel(ft, socket, addr);
-        }
-        //fprintf(stderr,"CHANNEL INCOMING DEF hass %s is id %d\n",hash.hex().c_str(),channel->id());
-
-    } else if (mych==CMDGW_TUNNEL_DEFAULT_CHANNEL_ID) {
-    	// SOCKTUNNEL
-    	CmdGwTunnelUDPDataCameIn(addr,CMDGW_TUNNEL_DEFAULT_CHANNEL_ID,evb);
-    	evbuffer_free(evb);
-    	return;
-    } else { // peer responds to my handshake (and other messages)
-        mych = DecodeID(mych);
-        if (mych>=channels.size())
-            return_log("%s invalid channel #%u, %s\n",tintstr(),mych,addr.str());
-        channel = channels[mych];
-        if (!channel)
-            return_log ("%s #%u is already closed\n",tintstr(),mych);
-	if (channel->IsDiffSenderOrDuplicate(addr,mych)) {
-	    channel->Schedule4Close();
-	    return_log ("%s #%u is duplicate\n",tintstr(),mych);
-	}
-        channel->own_id_mentioned_ = true;
-    }
-    channel->raw_bytes_down_ += evboriglen;
-    //dprintf("recvd %i bytes for %i\n",data.size(),channel->id);
-    bool wasestablished = channel->is_established();
-
-    //dprintf("%s #%u peer %s recv_peer %s addr %s\n", tintstr(),mych, channel->peer().str(), channel->recv_peer().str(), addr.str() );
-
-    channel->Recv(evb);
-
-    evbuffer_free(evb);
-    //SAFECLOSE
-    if (wasestablished && !channel->is_established()) {
-    	// Arno, 2012-01-26: Received an explict close, clean up channel, safely.
-    	channel->Schedule4Close();
-    }
+	for (; i<NUM_DATAGRAMS; ++i)
+		evbuffer_free(pevb[i]);
 }
 
 
