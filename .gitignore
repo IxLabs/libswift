@@ -10,3 +10,9 @@
 /swift-dynamic
 /test_file
 /tests/test_file
+
+
+/.sconsign.dblite
+/libswift.a
+/swift
+
