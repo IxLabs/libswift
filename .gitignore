@@ -1,0 +1,12 @@
+*.o
+*.log
+*~
+*.swp
+*.swo
+*.mhash
+
+123
+456
+/swift-dynamic
+/test_file
+/tests/test_file
