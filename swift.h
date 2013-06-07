@@ -67,7 +67,7 @@
 #include "avgspeed.h"
 // Arno, 2012-05-21: MacOS X has an Availability.h :-(
 #include "avail.h"
-
+#include "../kernel/mptp.h"
 
 namespace swift {
 
@@ -90,10 +90,10 @@ namespace swift {
 
 /** IPv4 address, just a nice wrapping around struct sockaddr_in. */
     struct Address {
-	struct sockaddr_in  addr;
+	struct sockaddr_mptp *addr;
 	static uint32_t LOCALHOST;
 	void set_port (uint16_t port) {
-	    addr.sin_port = htons(port);
+	    addr->dests[0].port = htons(port);
 	}
 	void set_port (const char* port_str) {
 	    int p;
@@ -101,16 +101,21 @@ namespace swift {
 		set_port(p);
 	}
 	void set_ipv4 (uint32_t ipv4) {
-	    addr.sin_addr.s_addr = htonl(ipv4);
+	    addr->dests[0].addr = htonl(ipv4);
 	}
 	void set_ipv4 (const char* ipv4_str) ;
 	//{    inet_aton(ipv4_str,&(addr.sin_addr));    }
 	void clear () {
-	    memset(&addr,0,sizeof(struct sockaddr_in));
-	    addr.sin_family = AF_INET;
+		addr = (struct sockaddr_mptp *)calloc(1, sizeof(struct sockaddr_mptp) + sizeof(struct mptp_dest));
+		addr->count = 1;
 	}
 	Address() {
 	    clear();
+	}
+	Address(const Address &b) {
+	    clear();
+		addr->dests[0].addr = b.addr->dests[0].addr;
+		addr->dests[0].port = b.addr->dests[0].port;
 	}
 	Address(const char* ip, uint16_t port)  {
 	    clear();
@@ -128,14 +133,29 @@ namespace swift {
 	    set_ipv4(ipv4addr);
 	    set_port(port);
 	}
-	Address(const struct sockaddr_in& address) : addr(address) {}
-	uint32_t ipv4 () const { return ntohl(addr.sin_addr.s_addr); }
-	uint16_t port () const { return ntohs(addr.sin_port); }
-	operator sockaddr_in () const {return addr;}
+	Address(const struct sockaddr_in& address) {
+		clear();
+		addr->dests[0].addr = address.sin_addr.s_addr;
+		addr->dests[0].port = address.sin_port;
+	}
+	~Address(){
+		free(addr);
+	}
+	uint32_t ipv4 () const { return ntohl(addr->dests[0].addr); }
+	uint16_t port () const { return ntohs(addr->dests[0].port); }
+	Address& operator = (const Address& b) {
+		if (this != &b) {
+			free(addr);
+			clear();
+			addr->dests[0].addr = b.addr->dests[0].addr;
+			addr->dests[0].port = b.addr->dests[0].port;
+		}
+		return *this;
+	}
 	bool operator == (const Address& b) const {
-	    return addr.sin_family==b.addr.sin_family &&
-		addr.sin_port==b.addr.sin_port &&
-		addr.sin_addr.s_addr==b.addr.sin_addr.s_addr;
+	    return addr->count == b.addr->count &&
+		addr->dests[0].port==b.addr->dests[0].port &&
+		addr->dests[0].addr==b.addr->dests[0].addr;
 	}
 	const char* str () const {
 		// Arno, 2011-10-04: not thread safe, replace.
@@ -470,6 +490,7 @@ namespace swift {
 	   being transferred between two peers. As we don't need buffers and
 	   lots of other TCP stuff, sizeof(Channel+members) must be below 1K.
 	   Normally, API users do not deal with this class. */
+	class MessageQueue;
     class Channel {
 
     public:
@@ -491,8 +512,11 @@ namespace swift {
         static struct event evrecv;
         static const char* SEND_CONTROL_MODES[];
 
+		static MessageQueue messageQueue;
+
 	    static tint epoch, start;
-	    static uint64_t global_dgrams_up, global_dgrams_down, global_raw_bytes_up, global_raw_bytes_down, global_bytes_up, global_bytes_down;
+	    static uint64_t global_dgrams_up, global_dgrams_down, global_raw_bytes_up, global_raw_bytes_down, global_bytes_up, global_bytes_down,
+						global_buffers_up, global_syscalls_up, global_buffers_down, global_syscalls_down;
         static void CloseChannelByAddress(const Address &addr);
 
         // SOCKMGMT
@@ -501,8 +525,8 @@ namespace swift {
         static void LibeventSendCallback(int fd, short event, void *arg);
         static void LibeventReceiveCallback(int fd, short event, void *arg);
         static void RecvDatagram (evutil_socket_t socket); // Called by LibeventReceiveCallback
-	    static int RecvFrom(evutil_socket_t sock, Address& addr, struct evbuffer *evb); // Called by RecvDatagram
-	    static int SendTo(evutil_socket_t sock, const Address& addr, struct evbuffer *evb); // Called by Channel::Send()
+	    static int RecvFrom(evutil_socket_t sock, Address& addr, struct evbuffer **evb); // Called by RecvDatagram
+	    static int SendTo(evutil_socket_t sock, const Address& addr, struct evbuffer **evb); // Called by Channel::Send()
 	    static evutil_socket_t Bind(Address address, sckrwecb_t callbacks=sckrwecb_t());
 	    static Address BoundAddress(evutil_socket_t sock);
 	    static evutil_socket_t default_socket()
@@ -528,7 +552,7 @@ namespace swift {
         void        OnHandshake (struct evbuffer *evb);
         void        OnRandomize (struct evbuffer *evb); //FRAGRAND
         void        AddHandshake (struct evbuffer *evb);
-        bin_t       AddData (struct evbuffer *evb);
+        bin_t       AddData (struct evbuffer **evb);
         void        AddAck (struct evbuffer *evb);
         void        AddHave (struct evbuffer *evb);
         void        AddHint (struct evbuffer *evb);
@@ -596,6 +620,7 @@ namespace swift {
         void 		Schedule4Close() { scheduled4close_ = true; }
         bool		IsScheduled4Close() { return scheduled4close_; }
 
+		void Sent(int bytes, evbuffer *evb, bool tofree);
 
         //ZEROSTATE
         void OnDataZeroState(struct evbuffer *evb);
@@ -990,6 +1015,78 @@ namespace swift {
     // SOCKTUNNEL
     void CmdGwTunnelUDPDataCameIn(Address srcaddr, uint32_t srcchan, struct evbuffer* evb);
     void CmdGwTunnelSendUDP(struct evbuffer *evb); // for friendship with Channel
+
+#define MAX_QUEUE_LENGTH 1
+#define TIMER_USEC 10000
+
+	class MessageQueue
+	{
+	public:
+		class Entry
+		{
+		public:
+			Entry(evbuffer *ievb, const Address &iaddr, Channel *ichannel, bool itofree)
+				:
+					evb(ievb),
+					addr(iaddr),
+					channel(ichannel),
+					tofree(itofree)
+			{
+			}
+
+			evbuffer *evb;
+			Address addr;
+			Channel *channel;
+			bool tofree;
+		};
+
+		typedef std::deque<Entry> EntryList;
+		typedef std::map<int, EntryList> EntryLists;
+	
+		void AddBuffer(int sock, evbuffer *evb, const Address &addr, Channel *channel, bool tofree = true)
+		{
+			EntryList &list = lists[sock];
+			list.push_back(Entry(evb, addr, channel, tofree));
+			if (list.size() == MAX_QUEUE_LENGTH)
+				Flush(sock);
+		}
+
+		void Flush(int sock)
+		{
+			EntryList &list = lists[sock];
+			if (list.empty())
+				return;
+
+			Address addr;
+			free(addr.addr);
+			addr.addr = (struct sockaddr_mptp *) calloc(1, sizeof(struct sockaddr_mptp) + list.size() * sizeof(struct mptp_dest));
+			addr.addr->count = list.size();
+			evbuffer *evbs[list.size()];
+			int i = 0;
+			for (EntryList::iterator it = list.begin(); it != list.end(); ++it, ++i) {
+				addr.addr->dests[i].addr = (*it).addr.addr->dests[0].addr;
+				addr.addr->dests[i].port = (*it).addr.addr->dests[0].port;
+				evbs[i] = (*it).evb;
+			}
+
+			int r = Channel::SendTo(sock, addr, evbs);
+			if (r > 0) {
+				i = 0;
+				for (EntryList::iterator it = list.begin(); it != list.end(); ++it, ++i)
+					(*it).channel->Sent(evbuffer_get_length((*it).evb), (*it).evb, (*it).tofree);
+			}
+			list.clear();
+		}
+
+		void Flush() 
+		{ 
+			for (EntryLists::iterator it = lists.begin(); it != lists.end(); ++it)
+				Flush(it->first);
+		}
+
+	private:
+		EntryLists lists;
+	};
 
 } // namespace end
 

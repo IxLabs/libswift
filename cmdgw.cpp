@@ -1089,7 +1089,10 @@ bool InstallCmdGateway (struct event_base *evbase,Address cmdaddr,Address httpad
 
     fprintf(stderr,"cmdgw: Creating new TCP listener on addr %s\n", cmdaddr.str() );
   
-    const struct sockaddr_in sin = (sockaddr_in)cmdaddr;
+    struct sockaddr_in sin;
+	sin.sin_addr.s_addr = cmdaddr.addr->dests[0].addr;
+	sin.sin_port = cmdaddr.addr->dests[0].port;
+	sin.sin_family = AF_INET;
 
     cmd_evlistener = evconnlistener_new_bind(evbase, CmdGwNewConnectionCallback, NULL,
         LEV_OPT_CLOSE_ON_FREE|LEV_OPT_REUSEABLE, -1,
@@ -1177,7 +1180,7 @@ void swift::CmdGwTunnelSendUDP(struct evbuffer *evb)
 	}
 	evutil_socket_t sock = Channel::sock_open[Channel::sock_count-1].sock;
 
-	Channel::SendTo(sock,cmd_tunnel_dest_addr,sendevbuf);
+	Channel::SendTo(sock,cmd_tunnel_dest_addr,&sendevbuf);
 
 	evbuffer_free(sendevbuf);
 }

@@ -13,6 +13,7 @@
 #include "compat.h"
 //#include <glog/logging.h>
 #include "swift.h"
+#include "../kernel/mptp.h"
 
 using namespace std;
 using namespace swift;
@@ -26,7 +27,9 @@ tint Channel::start = now_t::now;
 tint Channel::epoch = now_t::now/360000000LL*360000000LL; // make logs mergeable
 uint64_t Channel::global_dgrams_up=0, Channel::global_dgrams_down=0,
          Channel::global_raw_bytes_up=0, Channel::global_raw_bytes_down=0,
-         Channel::global_bytes_up=0, Channel::global_bytes_down=0;
+         Channel::global_bytes_up=0, Channel::global_bytes_down=0,
+		 Channel::global_buffers_up=0, Channel::global_syscalls_up=0,
+		 Channel::global_buffers_down=0, Channel::global_syscalls_down=0;
 sckrwecb_t Channel::sock_open[] = {};
 int Channel::sock_count = 0;
 swift::tint Channel::last_tick = 0;
@@ -222,12 +225,12 @@ tint Channel::Time () {
 
 // SOCKMGMT
 evutil_socket_t Channel::Bind (Address address, sckrwecb_t callbacks) {
-    struct sockaddr_in addr = address;
+    struct sockaddr_mptp *addr = address.addr;
     evutil_socket_t fd;
-    int len = sizeof(struct sockaddr_in), sndbuf=1<<20, rcvbuf=1<<20;
+    int len = sizeof(struct sockaddr_mptp) + addr->count*sizeof(struct mptp_dest), sndbuf=1<<20, rcvbuf=1<<20;
     #define dbnd_ensure(x) { if (!(x)) { \
         print_error("binding fails"); close_socket(fd); return INVALID_SOCKET; } }
-    dbnd_ensure ( (fd = socket(AF_INET, SOCK_DGRAM, 0)) >= 0 );
+    dbnd_ensure ( (fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_MPTP)) >= 0 );
     dbnd_ensure( make_socket_nonblocking(fd) );  // FIXME may remove this
     int enable = true;
     dbnd_ensure ( setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
@@ -235,7 +238,7 @@ evutil_socket_t Channel::Bind (Address address, sckrwecb_t callbacks) {
     dbnd_ensure ( setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
                              (setsockoptptr_t)&rcvbuf, sizeof(int)) == 0 );
     //setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (setsockoptptr_t)&enable, sizeof(int));
-    dbnd_ensure ( ::bind(fd, (sockaddr*)&addr, len) == 0 );
+    dbnd_ensure ( ::bind(fd, (sockaddr*)addr, len) == 0 );
 
     callbacks.sock = fd;
     sock_open[sock_count++] = callbacks;
@@ -261,32 +264,65 @@ Address swift::BoundAddress(evutil_socket_t sock) {
 }
 
 
-int Channel::SendTo (evutil_socket_t sock, const Address& addr, struct evbuffer *evb) {
+int Channel::SendTo (evutil_socket_t sock, const Address& addr, struct evbuffer **evb) {
 
-    int length = evbuffer_get_length(evb);
-    int r = sendto(sock,(const char *)evbuffer_pullup(evb, length),length,0,
-                   (struct sockaddr*)&(addr.addr),sizeof(struct sockaddr_in));
+	int count = addr.addr->count;
+	int addr_len = sizeof(struct sockaddr_mptp) + count * sizeof(struct mptp_dest);
+	struct iovec iov[count];
+	int lengths[count];
+	struct msghdr msg;
+	memset(&msg, 0, sizeof(msg));
+	memset(&iov, 0, sizeof(iov));
+	for (int i=0; i<count; ++i) {
+		lengths[i] = evbuffer_get_length(evb[i]);
+		iov[i].iov_base = evbuffer_pullup(evb[i], lengths[i]);
+		iov[i].iov_len = lengths[i];
+	}
+	msg.msg_iov = iov;
+	msg.msg_iovlen = count;
+	msg.msg_name = addr.addr;
+	msg.msg_namelen = addr_len;
+	int r = sendmsg(sock, &msg, 0);
     if (r<0) {
         print_error("can't send");
-        evbuffer_drain(evb, length); // Arno: behaviour is to pretend the packet got lost
+		for (int i=0; i<count; ++i)
+	        evbuffer_drain(evb[i], lengths[i]); // Arno: behaviour is to pretend the packet got lost
     }
     else
-    	evbuffer_drain(evb,r);
-    global_dgrams_up++;
-    global_raw_bytes_up+=length;
+		for (int i=0; i<count; ++i)
+			evbuffer_drain(evb[i], addr.addr->dests[i].bytes);
+    global_dgrams_up+=count;
+	global_buffers_up+=count;
+	global_syscalls_up++;
+	for (int i=0; i<count; ++i)
+		global_raw_bytes_up+=lengths[i];
     Time();
     return r;
 }
 
-int Channel::RecvFrom (evutil_socket_t sock, Address& addr, struct evbuffer *evb) {
-    socklen_t addrlen = sizeof(struct sockaddr_in);
-    struct evbuffer_iovec vec;
-    if (evbuffer_reserve_space(evb, SWIFT_MAX_RECV_DGRAM_SIZE, &vec, 1) < 0) {
-    	print_error("error on evbuffer_reserve_space");
-    	return 0;
-    }
-    int length = recvfrom (sock, (char *)vec.iov_base, SWIFT_MAX_RECV_DGRAM_SIZE, 0,
-			   (struct sockaddr*)&(addr.addr), &addrlen);
+int Channel::RecvFrom (evutil_socket_t sock, Address& addr, struct evbuffer **evb) {
+	int count = addr.addr->count;
+    socklen_t addrlen = sizeof(struct sockaddr_mptp) + count * sizeof(mptp_dest);
+    struct evbuffer_iovec vec[count];
+	for (int i=0; i<count; ++i) {
+		if (evbuffer_reserve_space(evb[i], SWIFT_MAX_RECV_DGRAM_SIZE, &vec[i], 1) < 0) {
+			print_error("error on evbuffer_reserve_space");
+			return 0;
+		}
+	}
+	struct iovec iov[count];
+	struct msghdr msg;
+	memset(&msg, 0, sizeof(msg));
+	memset(&iov, 0, sizeof(iov));
+	for (int i=0; i<count; ++i) {
+		iov[i].iov_base = vec[i].iov_base;
+		iov[i].iov_len = SWIFT_MAX_RECV_DGRAM_SIZE;
+	}
+	msg.msg_iov = iov;
+	msg.msg_iovlen = count;
+	msg.msg_name = addr.addr;
+	msg.msg_namelen = addrlen;
+	int length = recvmsg(sock, &msg, 0);
     if (length<0) {
         length = 0;
 
@@ -305,12 +341,18 @@ int Channel::RecvFrom (evutil_socket_t sock, Address& addr, struct evbuffer *evb
         else
             print_error("error on recv");
     }
-    vec.iov_len = length;
-    if (evbuffer_commit_space(evb, &vec, 1) < 0)  {
-        length = 0;
-        print_error("error on evbuffer_commit_space");
-    }
-    global_dgrams_down++;
+	length = 0;
+	for (int i=0; i<addr.addr->count; ++i) {
+		length += addr.addr->dests[i].bytes;
+		vec[i].iov_len = addr.addr->dests[i].bytes;
+		if (evbuffer_commit_space(evb[i], &vec[i], 1) < 0)  {
+			length = 0;
+			print_error("error on evbuffer_commit_space");
+		}
+	}
+    global_dgrams_down+=addr.addr->count;
+	global_buffers_down+=addr.addr->count;
+	global_syscalls_down++;
     global_raw_bytes_down+=length;
     Time();
     return length;
@@ -351,7 +393,7 @@ void Address::set_ipv4 (const char* ip_str) {
         print_error("cannot lookup address");
         return;
     } else {
-        addr.sin_addr.s_addr = *(u_long *) h->h_addr_list[0];
+        addr->dests[0].addr = *(u_long *) h->h_addr_list[0];
     }
 }
 
